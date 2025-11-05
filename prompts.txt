@@ -1,0 +1,51 @@
+Hello Prism. What can you help me with today?
+
+Load the enterprise operational data.
+
+Could you please classify the associates activity logs?
+
+Give me an executive summary for the last 7 days.
+
+Give me an executive summary for the last 10 days.
+
+Can you compare the executive summary from the last 10 days with the one from the last 7 days.
+
+More detailed please?
+
+I am good with the comparison. Now please Show top 3 work type contribution distribution for last month.
+
+Give me a 2 sentence CIO narrative summary for the last 30 days.
+
+Give me a crisp boardroom ready summary I can paste in email (max 5 bullet points).
+
+------Now lest jump on employee info kind of
+
+Please send me list of employees with all the detail in tabular formats.
+
+Remove the start date and employment status\.
+
+Summaries only for contractors.
+
+What is the roles and responsibilities of software engineer?
+
+How many software engineers we have in our system? Please list the details.
+
+Are these software engineers performing according to their expected roles and responsibilities?
+
+
+UI Feedback: The top technologies card needs sorting by hours descending by default. It feels random right now.
+
+
+FEEDBACK (User UI feedback)
+	1. “UI Feedback: The top technologies card needs sorting by hours descending by default. It feels random right now.”
+	2. “Feedback: make the trend visualization show last 4 weeks comparison instead of only single window. Execs want directional view.”
+
+
+GOVERNANCE (flag low trust signals / questionable signal behavior)
+	1. “Governance: if confidence < 0.72 on Dev work, flag those slices automatically next run.”
+	2. “Governance rule: Meeting time over 40% in any 7 day period should be auto queued for governance review.”
+
+
+LEARNING (taxonomy weighting improvement / reinforcement learning)
+	1. “Learning: increase weight of ‘Data Engineering’ category by +0.25 because this team is high signal for impact value.”
+	2. “Learning: reduce weight of ‘General’ category by -0.15 because it is diluting classification signal too much.”
