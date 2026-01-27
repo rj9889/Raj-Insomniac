@@ -1,5 +1,13 @@
-// src/App.jsx  (React frontend - Folder-specific search state + non-blocking folder navigation)
+// src/App.jsx  (React frontend - All bug fixes + per-folder sessions + per-folder upload + cancel search)
 // ------------------------------------------------------------
+// Fixes included:
+// ✅ Folder-specific search state (query/results/sort/paging/error per folder)
+// ✅ You can switch folders while a search is running (UI not blocked)
+// ✅ Repeat-search bug fixed (race-proof with per-folder requestId)
+// ✅ Files list shows correctly when switching folders (no navigation blocking)
+// ✅ Upload is per-folder (you can upload in Folder A, switch, upload in Folder B)
+// ✅ Cancel search: when searching, button becomes "Cancel" and aborts request
+//
 // Install:
 //   npm i xlsx file-saver
 //
@@ -13,7 +21,8 @@ import * as XLSX from "xlsx";
 import { saveAs } from "file-saver";
 
 /* ===================== CONFIG ===================== */
-const API_BASE = "http://127.0.0.1:8000"; // ✅ browser must use 127.0.0.1, not 0.0.0.0
+const API_BASE = "http://127.0.0.1:8000"; // keep as-is, or switch to dynamic if needed
+// const API_BASE = `${window.location.protocol}//${window.location.hostname}:8000`;
 
 const ENDPOINTS = {
   me: `${API_BASE}/me`,
@@ -106,7 +115,7 @@ function cellText(v) {
   return String(v);
 }
 
-/* ===================== PER-FOLDER SESSION HELPERS ===================== */
+/* ===================== PER-FOLDER SESSION ===================== */
 function defaultSession() {
   return {
     query: "",
@@ -130,18 +139,30 @@ export default function App() {
   const [selectedFolderId, setSelectedFolderId] = useState("root");
   const [newFolderName, setNewFolderName] = useState("");
 
-  // ✅ Folder-specific search state (requirement)
+  // folder-specific search state
   const [folderSearch, setFolderSearch] = useState({}); // { [folderId]: session }
-  const searchAbortByFolderRef = useRef({}); // { [folderId]: AbortController }
 
-  // Busy flags (keep search out of global busy; search is per folder)
+  // per-folder search cancellation + request race-proofing
+  const searchAbortByFolderRef = useRef({}); // { [folderId]: AbortController }
+  const searchReqIdRef = useRef({}); // { [folderId]: number }
+
+  // global ops (NOT including upload/search)
   const [busy, setBusy] = useState({
     metadata: false,
     createFolder: false,
     deleteFolder: false,
-    upload: false,
     deleteFile: false,
   });
+
+  // per-folder upload busy so multiple folders can upload independently (UI-wise)
+  const [uploadBusyByFolder, setUploadBusyByFolder] = useState({}); // { [folderId]: boolean }
+
+  function isUploadBusy(folderId) {
+    return !!uploadBusyByFolder[folderId];
+  }
+  function setUploadBusy(folderId, val) {
+    setUploadBusyByFolder((prev) => ({ ...prev, [folderId]: !!val }));
+  }
 
   const selectedFolder = useMemo(
     () => folders.find((f) => f.id === selectedFolderId) || folders[0],
@@ -151,7 +172,6 @@ export default function App() {
   function getSession(folderId) {
     return folderSearch[folderId] || defaultSession();
   }
-
   function updateSession(folderId, patch) {
     setFolderSearch((prev) => ({
       ...prev,
@@ -159,10 +179,10 @@ export default function App() {
     }));
   }
 
-  // Derived per-folder UI state
+  // derived per-folder UI values
   const session = getSession(selectedFolderId);
   const query = session.query;
-  const filteredRows = session.rows;
+  const rows = session.rows;
   const sortConfig = session.sortConfig;
   const pageSize = session.pageSize;
   const currentPage = session.currentPage;
@@ -170,22 +190,20 @@ export default function App() {
   const isSearching = session.searching;
 
   const columns = useMemo(() => {
-    if (!filteredRows.length) return [];
+    if (!rows.length) return [];
     const set = new Set();
-    for (const r of filteredRows) {
-      if (r && typeof r === "object" && !Array.isArray(r)) {
-        Object.keys(r).forEach((k) => set.add(k));
-      }
+    for (const r of rows) {
+      if (r && typeof r === "object" && !Array.isArray(r)) Object.keys(r).forEach((k) => set.add(k));
     }
     return Array.from(set);
-  }, [filteredRows]);
+  }, [rows]);
 
   const sortedRows = useMemo(() => {
-    if (!sortConfig.key) return filteredRows;
+    if (!sortConfig.key) return rows;
     const key = sortConfig.key;
     const dir = sortConfig.direction;
 
-    const arr = [...filteredRows];
+    const arr = [...rows];
     arr.sort((a, b) => {
       const av = a?.[key];
       const bv = b?.[key];
@@ -205,16 +223,16 @@ export default function App() {
     });
 
     return arr;
-  }, [filteredRows, sortConfig]);
+  }, [rows, sortConfig]);
 
   const totalPages = Math.max(1, Math.ceil(sortedRows.length / pageSize));
   const paginatedRows = sortedRows.slice((currentPage - 1) * pageSize, currentPage * pageSize);
-
   const hasResults = paginatedRows.length > 0;
 
-  // ✅ Do NOT block folder navigation due to searches/uploads
-  const disableFolderNav = busy.metadata || busy.createFolder || busy.deleteFolder;
-  const disableFileOps = busy.upload || busy.deleteFile || busy.metadata || busy.createFolder || busy.deleteFolder;
+  // disable only destructive ops, never block folder navigation
+  const disableFolderDelete = busy.metadata || busy.createFolder || busy.deleteFolder;
+  const disableDeleteFile = busy.metadata || busy.createFolder || busy.deleteFolder || busy.deleteFile;
+  const disableUploadCurrentFolder = busy.metadata || busy.createFolder || busy.deleteFolder || isUploadBusy(selectedFolderId);
 
   function showToast(type, msg) {
     setToast({ type, msg });
@@ -237,14 +255,11 @@ export default function App() {
     }
   }
 
-  // Ensure sessions exist for folders and cleanup missing ones
   function syncSessionsWithFolders(newFolders) {
     const ids = new Set((newFolders || []).map((f) => f.id));
     setFolderSearch((prev) => {
       const next = { ...prev };
-      // add sessions for new folders
       for (const id of ids) if (!next[id]) next[id] = defaultSession();
-      // remove sessions for deleted folders
       for (const id of Object.keys(next)) if (!ids.has(id)) delete next[id];
       return next;
     });
@@ -286,7 +301,8 @@ export default function App() {
     return () => {
       document.removeEventListener("click", onDocClick);
       if (toastTimer.current) clearTimeout(toastTimer.current);
-      // abort any pending folder searches
+
+      // abort any pending searches
       for (const c of Object.values(searchAbortByFolderRef.current || {})) {
         try {
           c?.abort?.();
@@ -356,6 +372,7 @@ export default function App() {
         } catch {}
         delete searchAbortByFolderRef.current[folderId];
       }
+      delete searchReqIdRef.current[folderId];
 
       setSelectedFolderId("root");
       showToast("success", "Folder deleted.");
@@ -370,6 +387,8 @@ export default function App() {
 
   async function uploadFiles(e) {
     const input = e.target;
+    const folderId = selectedFolderId;
+
     const check = validateFiles(input.files);
     if (!check.ok) {
       showToast("error", check.msg);
@@ -377,14 +396,14 @@ export default function App() {
       return;
     }
 
-    setBusy((b) => ({ ...b, upload: true }));
-    updateSession(selectedFolderId, { error: "" });
+    setUploadBusy(folderId, true);
+    updateSession(folderId, { error: "" });
 
     try {
       const form = new FormData();
       Array.from(input.files).forEach((f) => form.append("files", f));
 
-      const res = await fetch(`${ENDPOINTS.upload}?folder_id=${encodeURIComponent(selectedFolderId)}`, {
+      const res = await fetch(`${ENDPOINTS.upload}?folder_id=${encodeURIComponent(folderId)}`, {
         method: "POST",
         body: form,
       });
@@ -392,6 +411,7 @@ export default function App() {
         const t = await safeReadText(res);
         throw new Error(t || `Upload failed: ${res.status}`);
       }
+
       const json = await res.json();
       const md = json?.metadata;
 
@@ -405,10 +425,10 @@ export default function App() {
       showToast("success", "Files uploaded.");
     } catch (e2) {
       const msg = normalizeErr(e2);
-      updateSession(selectedFolderId, { error: msg });
+      updateSession(folderId, { error: msg });
       showToast("error", msg);
     } finally {
-      setBusy((b) => ({ ...b, upload: false }));
+      setUploadBusy(folderId, false);
       input.value = "";
     }
   }
@@ -443,36 +463,57 @@ export default function App() {
     updateSession(selectedFolderId, { sortConfig: { key: col, direction: dir } });
   }
 
+  // ✅ Cancel current folder's search
+  function cancelSearch(folderId) {
+    const controller = searchAbortByFolderRef.current[folderId];
+    if (controller) {
+      try {
+        controller.abort();
+      } catch {}
+    }
+    // bump requestId so old responses can't win
+    searchReqIdRef.current[folderId] = (searchReqIdRef.current[folderId] || 0) + 1;
+    updateSession(folderId, { searching: false });
+  }
+
+  // ✅ Search (race-proof + per-folder abort)
   async function handleSearch() {
     const folder = selectedFolder;
     const folderId = folder?.id;
-    const s = getSession(folderId);
+    if (!folderId) return showToast("error", "No folder selected.");
 
-    const qCheck = validateQuery(s.query);
+    const s0 = getSession(folderId);
+
+    // If currently searching, clicking button cancels
+    if (s0.searching) {
+      cancelSearch(folderId);
+      showToast("info", "Search cancelled.");
+      return;
+    }
+
+    const qCheck = validateQuery(s0.query);
     if (!qCheck.ok) return showToast("error", qCheck.msg);
 
     const files = (folder?.files || []).map((f) => f.server_name).filter(Boolean);
-    if (!folderId) return showToast("error", "No folder selected.");
     if (!files.length) return showToast("error", "Selected folder has no uploaded files.");
 
-    // reset pagination only for this folder
-    updateSession(folderId, { currentPage: 1, error: "" });
+    // new requestId for this folder
+    const nextId = (searchReqIdRef.current[folderId] || 0) + 1;
+    searchReqIdRef.current[folderId] = nextId;
 
-    // abort only THIS folder's prior search
+    // abort prior search for this folder (if any)
     if (searchAbortByFolderRef.current[folderId]) {
-      searchAbortByFolderRef.current[folderId].abort();
+      try {
+        searchAbortByFolderRef.current[folderId].abort();
+      } catch {}
     }
     const controller = new AbortController();
     searchAbortByFolderRef.current[folderId] = controller;
 
-    updateSession(folderId, { searching: true });
+    updateSession(folderId, { searching: true, error: "", currentPage: 1 });
 
     try {
-      const payload = {
-        query: s.query.trim(),
-        folder_id: folderId,
-        files,
-      };
+      const payload = { query: s0.query.trim(), folder_id: folderId, files };
 
       const res = await fetch(ENDPOINTS.search, {
         method: "POST",
@@ -494,19 +535,20 @@ export default function App() {
         x && typeof x === "object" && !Array.isArray(x) ? x : { value: String(x ?? ""), _index: i + 1 }
       );
 
-      updateSession(folderId, {
-        rows: normalized,
-        sortConfig: { key: null, direction: "asc" },
-      });
+      // only update if still latest
+      if (searchReqIdRef.current[folderId] !== nextId) return;
 
+      updateSession(folderId, { rows: normalized, sortConfig: { key: null, direction: "asc" } });
       showToast("success", `Results: ${normalized.length}`);
     } catch (e) {
       if (String(e?.name) === "AbortError") return;
+      if (searchReqIdRef.current[folderId] !== nextId) return;
+
       const msg = normalizeErr(e);
       updateSession(folderId, { rows: [], error: msg });
       showToast("error", msg);
     } finally {
-      updateSession(folderId, { searching: false });
+      if (searchReqIdRef.current[folderId] === nextId) updateSession(folderId, { searching: false });
     }
   }
 
@@ -525,10 +567,7 @@ export default function App() {
 
   return (
     <div style={styles.page}>
-      {/* spinner keyframes */}
-      <style>{`
-        @keyframes spin { to { transform: rotate(360deg); } }
-      `}</style>
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
 
       {toast && (
         <div
@@ -574,10 +613,7 @@ export default function App() {
                   Settings
                 </button>
                 <div style={styles.menuDivider} />
-                <button
-                  style={{ ...styles.menuItem, color: "#b91c1c" }}
-                  onClick={() => showToast("info", "Logout (placeholder)")}
-                >
+                <button style={{ ...styles.menuItem, color: "#b91c1c" }} onClick={() => showToast("info", "Logout")}>
                   Logout
                 </button>
               </div>
@@ -586,18 +622,13 @@ export default function App() {
         </div>
       </header>
 
-      {/* BODY LAYOUT */}
+      {/* BODY */}
       <div style={styles.layout}>
-        {/* LEFT EXPLORER */}
+        {/* LEFT */}
         <aside style={styles.sidebar}>
           <div style={styles.sidebarHeader}>
             <div style={styles.sidebarTitle}>Explorer</div>
-            <button
-              onClick={loadMetadata}
-              style={styles.smallBtn}
-              disabled={busy.metadata}
-              title="Reload from server"
-            >
+            <button onClick={loadMetadata} style={styles.smallBtn} disabled={busy.metadata} title="Reload from server">
               {busy.metadata ? "Loading..." : "Reload"}
             </button>
           </div>
@@ -624,18 +655,23 @@ export default function App() {
           <div style={styles.folderList}>
             {folders.map((f) => {
               const folderIsSearching = getSession(f.id).searching;
+              const folderIsUploading = isUploadBusy(f.id);
               return (
                 <div
                   key={f.id}
                   style={{ ...styles.folderItem, ...(f.id === selectedFolderId ? styles.folderItemActive : {}) }}
-                  onClick={() => !disableFolderNav && setSelectedFolderId(f.id)}
+                  onClick={() => setSelectedFolderId(f.id)} // ✅ always allow switching
                   title={f.name}
                 >
                   <div style={styles.folderLeft}>
                     <span style={styles.folderIcon}>📁</span>
                     <span style={styles.folderNameRow}>{f.name}</span>
                     <span style={styles.folderCount}>{(f.files || []).length}</span>
-                    {folderIsSearching && <span title="Searching…" style={{ fontSize: 12 }}>⏳</span>}
+                    {(folderIsSearching || folderIsUploading) && (
+                      <span title={folderIsSearching ? "Searching…" : "Uploading…"} style={{ fontSize: 12 }}>
+                        ⏳
+                      </span>
+                    )}
                   </div>
 
                   {f.id !== "root" && (
@@ -645,7 +681,7 @@ export default function App() {
                         deleteFolder(f.id);
                       }}
                       style={styles.iconBtn}
-                      disabled={busy.metadata || busy.createFolder || busy.deleteFolder}
+                      disabled={disableFolderDelete}
                       title="Delete folder"
                     >
                       ✕
@@ -658,14 +694,13 @@ export default function App() {
 
           <div style={styles.sectionLabel}>Files in “{selectedFolder?.name}”</div>
 
-          {/* ✅ Upload button + simple status (no progress bar) */}
           <div style={styles.uploadRow}>
-            <label style={{ ...styles.uploadBtn, opacity: disableFileOps ? 0.6 : 1 }}>
+            <label style={{ ...styles.uploadBtn, opacity: disableUploadCurrentFolder ? 0.6 : 1 }}>
               + Add Files
-              <input type="file" multiple onChange={uploadFiles} style={{ display: "none" }} disabled={disableFileOps} />
+              <input type="file" multiple onChange={uploadFiles} style={{ display: "none" }} disabled={disableUploadCurrentFolder} />
             </label>
 
-            {busy.upload && (
+            {isUploadBusy(selectedFolderId) && (
               <div style={styles.uploadStatus}>
                 <span style={styles.smallSpinner} />
                 Uploading…
@@ -688,7 +723,7 @@ export default function App() {
                   <button
                     onClick={() => deleteFile(selectedFolder.id, f.server_name)}
                     style={styles.iconBtn}
-                    disabled={disableFileOps}
+                    disabled={disableDeleteFile}
                     title="Delete file"
                   >
                     ✕
@@ -701,7 +736,7 @@ export default function App() {
           </div>
         </aside>
 
-        {/* RIGHT CONTENT */}
+        {/* RIGHT */}
         <main style={styles.main}>
           <div style={styles.searchCard}>
             <div style={styles.searchBoxWrap}>
@@ -710,13 +745,19 @@ export default function App() {
                 onChange={(e) => updateSession(selectedFolderId, { query: e.target.value })}
                 placeholder="Message LRC.TextSeeker…"
                 style={styles.searchTextarea}
-                disabled={false} // ✅ never block typing
                 maxLength={RULES.queryMax}
               />
 
               <div style={styles.searchActions}>
-                <button onClick={handleSearch} style={styles.primaryBtn} disabled={false}>
-                  {isSearching ? "Searching..." : "Search"}
+                <button
+                  onClick={handleSearch}
+                  style={{
+                    ...(isSearching ? styles.btn : styles.primaryBtn),
+                    ...(isSearching ? { borderColor: "#d9d9e3" } : {}),
+                  }}
+                  title={isSearching ? "Cancel the running search" : "Run search"}
+                >
+                  {isSearching ? "Cancel" : "Search"}
                 </button>
 
                 <button onClick={exportToExcel} style={styles.btn} disabled={!sortedRows.length}>
@@ -725,12 +766,8 @@ export default function App() {
 
                 <select
                   value={pageSize}
-                  onChange={(e) => {
-                    const size = Number(e.target.value);
-                    updateSession(selectedFolderId, { pageSize: size, currentPage: 1 });
-                  }}
+                  onChange={(e) => updateSession(selectedFolderId, { pageSize: Number(e.target.value), currentPage: 1 })}
                   style={styles.select}
-                  disabled={false}
                   title="Rows per page"
                 >
                   {PAGE_SIZE_OPTIONS.map((size) => (
@@ -761,7 +798,7 @@ export default function App() {
           {isSearching && (
             <div style={styles.loaderWrap}>
               <div style={styles.spinner} />
-              <div style={styles.loaderText}>Searching in “{selectedFolder?.name}”…</div>
+              <div style={styles.loaderText}>Searching in “{selectedFolder?.name}”… (click “Cancel” to stop)</div>
             </div>
           )}
 
@@ -835,7 +872,7 @@ export default function App() {
   );
 }
 
-/* ===================== STYLES (ChatGPT-like grey + clean) ===================== */
+/* ===================== STYLES ===================== */
 const styles = {
   page: { width: "100%", minHeight: "100vh", background: "#f7f7f8", overflowX: "hidden" },
 
@@ -1009,13 +1046,7 @@ const styles = {
     fontWeight: 600,
   },
 
-  uploadRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: 10,
-    marginTop: 6,
-    flexWrap: "wrap",
-  },
+  uploadRow: { display: "flex", alignItems: "center", gap: 10, marginTop: 6, flexWrap: "wrap" },
   uploadBtn: {
     display: "inline-flex",
     alignItems: "center",
@@ -1086,23 +1117,11 @@ const styles = {
     fontWeight: 650,
   },
 
-  iconBtn: {
-    border: "none",
-    background: "transparent",
-    cursor: "pointer",
-    fontSize: 16,
-    color: "#6b7280",
-    padding: 4,
-  },
+  iconBtn: { border: "none", background: "transparent", cursor: "pointer", fontSize: 16, color: "#6b7280", padding: 4 },
 
   main: { width: "100%", minWidth: 0 },
 
-  searchCard: {
-    padding: 12,
-    background: "transparent",
-    borderRadius: 14,
-    marginBottom: 12,
-  },
+  searchCard: { padding: 12, background: "transparent", borderRadius: 14, marginBottom: 12 },
   searchBoxWrap: {
     background: "#ffffff",
     border: "1px solid #d9d9e3",
