@@ -1,12 +1,13 @@
 # main.py  (FastAPI backend) — COMPLETE
 # ------------------------------------------------------------
 # Features:
-# ✅ /metadata, /folders, /upload, /delete file, /search (table)
-# ✅ /chat/search (chat mode with full conversation context)
-# ✅ On upload: create <stem>_<id>_normalised.json (empty JSON)
-# ✅ On delete: delete original + normalized
-# ✅ Atomic metadata save + lock
-# ✅ TEST: /search supports optional delay knobs
+# ✅ /me, /metadata, /folders, /upload, delete folder/file
+# ✅ Upload creates companion: <stem>_<id>_normalised.json
+# ✅ Delete removes both original + normalized
+# ✅ /search => returns {"LLMRESPONSE": [...]} for TABLE
+# ✅ /chat/search => returns {"assistant_text": "...", "LLMRESPONSE":[...]} for CHATBOT
+#    - assistant_text is a ChatGPT-like answer (no "see table")
+#    - includes prior messages (context) in request model
 #
 # Run:
 #   pip install fastapi uvicorn python-multipart pydantic
@@ -20,7 +21,6 @@ from typing import List, Dict, Any, Optional, Literal
 import json, shutil, threading, time
 from pathlib import Path
 from uuid import uuid4
-
 
 APP_ROOT = Path(__file__).parent.resolve()
 STORAGE_DIR = APP_ROOT / "storage"
@@ -146,7 +146,18 @@ def _create_empty_normalised_json(full_path: Path) -> None:
             json.dump({"items": []}, f)
 
 
-def _validate_files_for_folder(folder: Dict[str, Any], files: List[str]) -> None:
+def _validate_folder_files(folder_id: str, files: List[str]) -> Dict[str, Any]:
+    """
+    Validates:
+      - folder exists
+      - each file belongs to folder metadata
+      - file exists on disk
+    Returns folder dict.
+    """
+    with META_LOCK:
+        data = _load_metadata()
+        folder = _get_folder(data, folder_id)
+
     allowed = set(f.get("server_name") for f in folder.get("files", []))
     missing = []
     not_in_folder = []
@@ -163,6 +174,53 @@ def _validate_files_for_folder(folder: Dict[str, Any], files: List[str]) -> None
         raise HTTPException(status_code=400, detail=f"Some files not in selected folder: {not_in_folder[:5]}")
     if missing:
         raise HTTPException(status_code=400, detail=f"Some files missing on server: {missing[:5]}")
+
+    return folder
+
+
+def _build_chat_answer(query: str, results: List[Dict[str, Any]]) -> str:
+    """
+    Creates a ChatGPT-style answer string from search results.
+    Replace this with your real LLM later.
+    """
+    q = (query or "").strip()
+    if not results:
+        return f"I couldn’t find anything relevant for: “{q}”."
+
+    # Pick top 5-ish
+    top = results[:5]
+
+    # Try to summarize nicely
+    lines = []
+    lines.append(f"Here’s what I found for: “{q}”")
+    lines.append("")
+
+    for i, r in enumerate(top, start=1):
+        file_name = str(r.get("file", ""))
+        snippet = str(r.get("snippet", "")).strip()
+        page = r.get("page", None)
+        line = r.get("line", None)
+        score = r.get("score", None)
+
+        meta_bits = []
+        if score is not None:
+            meta_bits.append(f"score {score}")
+        if page is not None:
+            meta_bits.append(f"page {page}")
+        if line is not None:
+            meta_bits.append(f"line {line}")
+
+        meta = f" ({', '.join(meta_bits)})" if meta_bits else ""
+        if snippet:
+            lines.append(f"{i}) {snippet}")
+        else:
+            lines.append(f"{i}) Match in {file_name}{meta}")
+        if file_name:
+            lines.append(f"   • file: {file_name}{meta}")
+
+    lines.append("")
+    lines.append("If you want, tell me what exact field/value you want (name, enrolled no, decision etc.) and I’ll extract only that.")
+    return "\n".join(lines)
 
 
 app = FastAPI()
@@ -251,6 +309,7 @@ async def upload(folder_id: str = Query(..., min_length=1), files: List[UploadFi
         folder_path = STORAGE_DIR / folder_id
         folder_path.mkdir(parents=True, exist_ok=True)
 
+        # de-dupe by original name (keep latest)
         existing_by_name = {fe.get("original_name"): fe for fe in folder.get("files", [])}
 
         for up in files:
@@ -340,18 +399,35 @@ class SearchRequest(BaseModel):
     folder_id: str = Field(..., min_length=1, max_length=200)
     files: List[str] = Field(default_factory=list, min_length=1)
 
-    # TEST knobs
+    # test-only knobs
     delay_ms: int = Field(default=0, ge=0, le=300000)
     per_file_delay_ms: int = Field(default=0, ge=0, le=60000)
 
 
-def _simulate_results(folder_id: str, files: List[str], q: str) -> List[Dict[str, Any]]:
+@app.post("/search")
+def search(req: SearchRequest) -> Dict[str, Any]:
+    _validate_folder_files(req.folder_id, req.files)
+
+    q = req.query.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    # simulate slowness if > 5 files
+    if len(req.files) > 5:
+        fixed = (req.delay_ms or 0) / 1000.0
+        per_file = (req.per_file_delay_ms or 0) / 1000.0
+        if fixed == 0 and per_file == 0:
+            fixed = 2.0
+            per_file = 0.5
+        time.sleep(fixed + per_file * len(req.files))
+
+    # TODO: Replace with your real retrieval/LLM logic
     results = []
-    for idx, f in enumerate(files, start=1):
+    for idx, f in enumerate(req.files, start=1):
         results.append(
             {
                 "resultId": idx,
-                "folderId": folder_id,
+                "folderId": req.folder_id,
                 "file": f,
                 "query": q,
                 "score": round(0.85 + (idx % 10) * 0.01, 2),
@@ -361,34 +437,11 @@ def _simulate_results(folder_id: str, files: List[str], q: str) -> List[Dict[str
                 "source": "FastAPI",
             }
         )
-    return results
+
+    return {"LLMRESPONSE": results}
 
 
-@app.post("/search")
-def search(req: SearchRequest) -> Dict[str, Any]:
-    with META_LOCK:
-        data = _load_metadata()
-        folder = _get_folder(data, req.folder_id)
-
-    q = req.query.strip()
-    if not q:
-        raise HTTPException(status_code=400, detail="query is required")
-
-    _validate_files_for_folder(folder, req.files)
-
-    # simulate slowness when > 5 files
-    if len(req.files) > 5:
-        fixed = (req.delay_ms or 0) / 1000.0
-        per_file = (req.per_file_delay_ms or 0) / 1000.0
-        if fixed == 0 and per_file == 0:
-            fixed = 2.0
-            per_file = 0.5
-        time.sleep(fixed + per_file * len(req.files))
-
-    return {"LLMRESPONSE": _simulate_results(req.folder_id, req.files, q)}
-
-
-# -------------------- CHAT SEARCH (WITH CONTEXT) --------------------
+# -------------------- CHAT SEARCH (CHATBOT) --------------------
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(..., min_length=1, max_length=20000)
@@ -400,33 +453,30 @@ class ChatSearchRequest(BaseModel):
     files: List[str] = Field(default_factory=list, min_length=1)
     messages: List[ChatMessage] = Field(default_factory=list)
 
+    # optional test-only delay
+    delay_ms: int = Field(default=0, ge=0, le=300000)
+    per_file_delay_ms: int = Field(default=0, ge=0, le=60000)
+
 
 @app.post("/chat/search")
 def chat_search(req: ChatSearchRequest) -> Dict[str, Any]:
-    with META_LOCK:
-        data = _load_metadata()
-        folder = _get_folder(data, req.folder_id)
+    _validate_folder_files(req.folder_id, req.files)
 
-    q = req.query.strip()
-    if not q:
-        raise HTTPException(status_code=400, detail="query is required")
+    # (optional) reuse same slowness simulation
+    if len(req.files) > 5:
+        fixed = (req.delay_ms or 0) / 1000.0
+        per_file = (req.per_file_delay_ms or 0) / 1000.0
+        if fixed == 0 and per_file == 0:
+            fixed = 2.0
+            per_file = 0.5
+        time.sleep(fixed + per_file * len(req.files))
 
-    _validate_files_for_folder(folder, req.files)
+    # reuse same base retrieval for now
+    base = search(SearchRequest(query=req.query, folder_id=req.folder_id, files=req.files))
+    results = base.get("LLMRESPONSE", [])
 
-    # You can plug your real retrieval + LLM here.
-    # For now: return same grid results + an assistant message that "uses context"
-    results = _simulate_results(req.folder_id, req.files, q)
-
-    # very simple "context use" demo
-    last_user_msgs = [m.content for m in req.messages if m.role == "user"][-3:]
-    context_line = " | ".join(last_user_msgs) if last_user_msgs else "(no prior chat)"
-
-    assistant_text = (
-        f"Got it. You asked: '{q}'.\n"
-        f"Recent context: {context_line}\n\n"
-        f"I found {len(results)} matches in your selected folder files. "
-        f"Switch to the Table tab to view the full grid results."
-    )
+    # ✅ build chat answer (replace with real LLM later)
+    assistant_text = _build_chat_answer(req.query, results)
 
     return {
         "assistant_text": assistant_text,
@@ -434,7 +484,7 @@ def chat_search(req: ChatSearchRequest) -> Dict[str, Any]:
     }
 
 
-# -------------------- IQA (as you had) --------------------
+# -------------------- IQA (UNCHANGED) --------------------
 class IQAProcessRequest(BaseModel):
     folder_id: str = Field(..., min_length=1, max_length=200)
     files: List[str] = Field(default_factory=list, min_length=1)
@@ -442,11 +492,7 @@ class IQAProcessRequest(BaseModel):
 
 @app.post("/iqa/process")
 def iqa_process(req: IQAProcessRequest) -> Dict[str, Any]:
-    with META_LOCK:
-        data = _load_metadata()
-        folder = _get_folder(data, req.folder_id)
-
-    _validate_files_for_folder(folder, req.files)
+    _validate_folder_files(req.folder_id, req.files)
 
     rows = []
     for idx, f in enumerate(req.files, start=1):
