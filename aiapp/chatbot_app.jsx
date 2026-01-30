@@ -1,12 +1,11 @@
-// src/App.jsx  (COMPLETE)
+// src/App.jsx  (Complete - FIXED: Chat + Table separated state + separate endpoints)
 // ----------------------------------------------------------------------------------------------------
-// ✅ Chat + Table tabs (manual switch only; NO auto-switch)
-// ✅ Chat history never disappears (right side user, left side assistant)
-// ✅ Separate Chat Query vs Table Query (fix cross-impact bugs)
-// ✅ Separate searchingChat vs searchingTable (fix shared spinner bugs)
+// ✅ Chat + Table tabs (manual switch only)
+// ✅ Chat history never disappears
+// ✅ Chat search uses POST /chat/search (sends chat context)
 // ✅ Table search uses POST /search (no chat side effects)
-// ✅ Chat search uses POST /chat/search and sends full conversation context
-// ✅ Per-folder sessions + per-folder upload + cancel search + race-proof requestId
+// ✅ No more: table search impacting chat, shared spinner, query clearing wrong place
+// ✅ Per-folder sessions + per-folder upload + cancel search + race-proof requestId (per mode)
 //
 // Install:
 //   npm i xlsx file-saver
@@ -31,12 +30,8 @@ const ENDPOINTS = {
   upload: `${API_BASE}/upload`,
   deleteFile: (folderId, serverName) =>
     `${API_BASE}/folders/${folderId}/files?server_name=${encodeURIComponent(serverName)}`,
-
-  // ✅ table search
-  search: `${API_BASE}/search`,
-
-  // ✅ chat search (new)
-  chatSearch: `${API_BASE}/chat/search`,
+  search: `${API_BASE}/search`, // table
+  chatSearch: `${API_BASE}/chat/search`, // chat
 };
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
@@ -45,7 +40,7 @@ const RULES = {
   folderNameMax: 60,
   queryMax: 5000,
   maxFilesPerUpload: 50,
-  maxFileSizeBytes: 50 * 1024 * 1024, // 50MB
+  maxFileSizeBytes: 50 * 1024 * 1024,
 };
 
 /* ===================== HELPERS ===================== */
@@ -126,50 +121,12 @@ function nowHHMM() {
   const mm = String(d.getMinutes()).padStart(2, "0");
   return `${hh}:${mm}`;
 }
-function rowsToChatText(rows) {
-  if (!Array.isArray(rows) || !rows.length) return "No results found.";
-
-  const looksSimple = rows.every(
-    (r) =>
-      r &&
-      typeof r === "object" &&
-      !Array.isArray(r) &&
-      Object.keys(r).every((k) => ["value", "_index"].includes(k))
-  );
-  if (looksSimple) {
-    return rows
-      .map((r) => `• ${String(r.value ?? "").trim()}`)
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  const hasAnswer = rows.some((r) => r && typeof r === "object" && "answer" in r);
-  if (hasAnswer) {
-    return rows
-      .map((r) => {
-        const ans = r?.answer ? String(r.answer) : "";
-        const files =
-          Array.isArray(r?.matched_files) && r.matched_files.length ? `\nFiles: ${r.matched_files.join(", ")}` : "";
-        return `${ans}${files}`.trim();
-      })
-      .join("\n\n");
-  }
-
-  return rows
-    .map((r, idx) => {
-      const keys = Object.keys(r || {}).filter((k) => k !== "_index");
-      if (!keys.length) return `${idx + 1}. (empty row)`;
-      const lines = keys.map((k) => `${k}: ${cellText(r?.[k])}`);
-      return `${idx + 1}.\n${lines.join("\n")}`;
-    })
-    .join("\n\n");
-}
 
 /* ===================== PER-FOLDER SESSION ===================== */
 function defaultSession() {
   return {
     error: "",
-    viewMode: "chat",
+    viewMode: "chat", // "chat" | "table"
 
     // ✅ CHAT
     chatQuery: "",
@@ -186,6 +143,10 @@ function defaultSession() {
   };
 }
 
+function keyFor(folderId, mode) {
+  return `${folderId}|${mode}`; // mode: "chat" | "table"
+}
+
 export default function App() {
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
@@ -199,9 +160,9 @@ export default function App() {
 
   const [folderSearch, setFolderSearch] = useState({}); // { [folderId]: session }
 
-  // ✅ per folder + per mode (chat/table)
-  const abortRef = useRef({});     // { "fld|chat": AbortController, "fld|table": AbortController }
-  const reqIdRef = useRef({});     // { "fld|chat": number, "fld|table": number }
+  // ✅ separate cancel/race per folder+mode
+  const searchAbortRef = useRef({}); // { "folder|chat": AbortController, "folder|table": AbortController }
+  const searchReqIdRef = useRef({}); // { "folder|chat": number, "folder|table": number }
 
   const [busy, setBusy] = useState({
     metadata: false,
@@ -214,10 +175,6 @@ export default function App() {
 
   const chatEndRef = useRef(null);
   const chatInputRef = useRef(null);
-
-  function keyFor(folderId, mode) {
-    return `${folderId}|${mode}`;
-  }
 
   function isUploadBusy(folderId) {
     return !!uploadBusyByFolder[folderId];
@@ -257,7 +214,7 @@ export default function App() {
     });
   }
 
-  // derived
+  // derived per-folder UI values
   const session = getSession(selectedFolderId);
   const viewMode = session.viewMode;
 
@@ -271,12 +228,13 @@ export default function App() {
   const error = session.error;
   const chat = session.chat || [];
 
+  // ✅ scroll only for chat mode
   useEffect(() => {
     if (viewMode !== "chat") return;
     try {
       chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
     } catch {}
-  }, [chat.length, isSearching, viewMode]);
+  }, [chat.length, session.searchingChat, viewMode]);
 
   const columns = useMemo(() => {
     if (!rows.length) return [];
@@ -390,8 +348,8 @@ export default function App() {
       document.removeEventListener("click", onDocClick);
       if (toastTimer.current) clearTimeout(toastTimer.current);
 
-      // abort all searches
-      for (const c of Object.values(abortRef.current || {})) {
+      // abort all in-flight
+      for (const c of Object.values(searchAbortRef.current || {})) {
         try {
           c?.abort?.();
         } catch {}
@@ -453,16 +411,16 @@ export default function App() {
       setFolders(json.folders);
       syncSessionsWithFolders(json.folders);
 
-      // abort any searches for that folder (both modes)
+      // abort searches for this folder (chat+table)
       for (const mode of ["chat", "table"]) {
         const k = keyFor(folderId, mode);
-        if (abortRef.current[k]) {
+        if (searchAbortRef.current[k]) {
           try {
-            abortRef.current[k].abort();
+            searchAbortRef.current[k].abort();
           } catch {}
-          delete abortRef.current[k];
+          delete searchAbortRef.current[k];
         }
-        delete reqIdRef.current[k];
+        delete searchReqIdRef.current[k];
       }
 
       setSelectedFolderId("root");
@@ -557,20 +515,20 @@ export default function App() {
   function cancelSearch(folderId, mode) {
     const k = keyFor(folderId, mode);
 
-    const controller = abortRef.current[k];
+    const controller = searchAbortRef.current[k];
     if (controller) {
       try {
         controller.abort();
       } catch {}
     }
 
-    reqIdRef.current[k] = (reqIdRef.current[k] || 0) + 1;
+    searchReqIdRef.current[k] = (searchReqIdRef.current[k] || 0) + 1;
 
     if (mode === "chat") updateSession(folderId, { searchingChat: false });
     else updateSession(folderId, { searchingTable: false });
   }
 
-  // chat input enter-to-send
+  // chat enter-to-send
   function onChatInputKeyDown(e) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -578,7 +536,7 @@ export default function App() {
     }
   }
 
-  // ✅ TABLE SEARCH: no chat side effects
+  // -------------------- TABLE SEARCH --------------------
   async function handleTableSearch() {
     const folder = selectedFolder;
     const folderId = folder?.id;
@@ -586,7 +544,7 @@ export default function App() {
 
     const s0 = getSession(folderId);
 
-    // cancel
+    // cancel table search only
     if (s0.searchingTable) {
       cancelSearch(folderId, "table");
       showToast("info", "Table search cancelled.");
@@ -601,16 +559,17 @@ export default function App() {
     if (!files.length) return showToast("error", "Selected folder has no uploaded files.");
 
     const k = keyFor(folderId, "table");
-    const nextId = (reqIdRef.current[k] || 0) + 1;
-    reqIdRef.current[k] = nextId;
+    const nextId = (searchReqIdRef.current[k] || 0) + 1;
+    searchReqIdRef.current[k] = nextId;
 
-    if (abortRef.current[k]) {
+    // abort old table request
+    if (searchAbortRef.current[k]) {
       try {
-        abortRef.current[k].abort();
+        searchAbortRef.current[k].abort();
       } catch {}
     }
     const controller = new AbortController();
-    abortRef.current[k] = controller;
+    searchAbortRef.current[k] = controller;
 
     updateSession(folderId, { searchingTable: true, error: "", currentPage: 1 });
 
@@ -637,24 +596,25 @@ export default function App() {
         x && typeof x === "object" && !Array.isArray(x) ? x : { value: String(x ?? ""), _index: i + 1 }
       );
 
-      if (reqIdRef.current[k] !== nextId) return;
+      if (searchReqIdRef.current[k] !== nextId) return;
 
       updateSession(folderId, { rows: normalized, sortConfig: { key: null, direction: "asc" } });
 
+      // ✅ IMPORTANT: do NOT clear tableQuery (keeps typed text)
       showToast("success", `Results: ${normalized.length}`);
     } catch (e) {
       if (String(e?.name) === "AbortError") return;
-      if (reqIdRef.current[k] !== nextId) return;
+      if (searchReqIdRef.current[k] !== nextId) return;
 
       const msg = normalizeErr(e);
       updateSession(folderId, { rows: [], error: msg });
       showToast("error", msg);
     } finally {
-      if (reqIdRef.current[k] === nextId) updateSession(folderId, { searchingTable: false });
+      if (searchReqIdRef.current[k] === nextId) updateSession(folderId, { searchingTable: false });
     }
   }
 
-  // ✅ CHAT SEARCH: pushes chat + clears chatQuery only + sends chat history to backend
+  // -------------------- CHAT SEARCH --------------------
   async function handleChatSearch() {
     const folder = selectedFolder;
     const folderId = folder?.id;
@@ -662,7 +622,7 @@ export default function App() {
 
     const s0 = getSession(folderId);
 
-    // cancel
+    // cancel chat search only
     if (s0.searchingChat) {
       cancelSearch(folderId, "chat");
       showToast("info", "Chat search cancelled.");
@@ -676,38 +636,42 @@ export default function App() {
     const files = (folder?.files || []).map((f) => f.server_name).filter(Boolean);
     if (!files.length) return showToast("error", "Selected folder has no uploaded files.");
 
-    // push user msg
+    // push user message
     pushChat(folderId, "user", q);
 
-    // clear chat textbox only
+    // clear only chat textbox
     updateSession(folderId, { chatQuery: "" });
     try {
       chatInputRef.current?.focus?.();
     } catch {}
 
     const k = keyFor(folderId, "chat");
-    const nextId = (reqIdRef.current[k] || 0) + 1;
-    reqIdRef.current[k] = nextId;
+    const nextId = (searchReqIdRef.current[k] || 0) + 1;
+    searchReqIdRef.current[k] = nextId;
 
-    if (abortRef.current[k]) {
+    // abort old chat request
+    if (searchAbortRef.current[k]) {
       try {
-        abortRef.current[k].abort();
+        searchAbortRef.current[k].abort();
       } catch {}
     }
     const controller = new AbortController();
-    abortRef.current[k] = controller;
+    searchAbortRef.current[k] = controller;
 
     updateSession(folderId, { searchingChat: true, error: "" });
 
     try {
-      // send conversation context
-      const chatNow = getSession(folderId).chat || [];
-      const messages = chatNow.map((m) => ({
+      const fullChat = (getSession(folderId).chat || []).map((m) => ({
         role: m.role === "user" ? "user" : "assistant",
         content: m.text,
       }));
 
-      const payload = { query: q, folder_id: folderId, files, messages };
+      const payload = {
+        query: q,
+        folder_id: folderId,
+        files,
+        messages: fullChat, // ✅ context
+      };
 
       const res = await fetch(ENDPOINTS.chatSearch, {
         method: "POST",
@@ -723,9 +687,15 @@ export default function App() {
 
       const json = await res.json();
 
-      if (reqIdRef.current[k] !== nextId) return;
+      if (searchReqIdRef.current[k] !== nextId) return;
 
-      // optional: update table rows too (nice for switching to Table)
+      const assistantText = String(json?.assistant_text || "").trim();
+      if (!assistantText) throw new Error("Invalid response: expected {assistant_text}");
+
+      // ✅ show result directly in chatbot
+      pushChat(folderId, "assistant", assistantText);
+
+      // optional: also keep rows updated for table view
       const data = json?.LLMRESPONSE;
       if (Array.isArray(data)) {
         const normalized = data.map((x, i) =>
@@ -734,19 +704,16 @@ export default function App() {
         updateSession(folderId, { rows: normalized, sortConfig: { key: null, direction: "asc" } });
       }
 
-      const assistantText = String(json?.assistant_text || rowsToChatText(json?.LLMRESPONSE || []));
-      pushChat(folderId, "assistant", assistantText);
-
       showToast("success", "Answered.");
     } catch (e) {
       if (String(e?.name) === "AbortError") return;
-      if (reqIdRef.current[k] !== nextId) return;
+      if (searchReqIdRef.current[k] !== nextId) return;
 
       const msg = normalizeErr(e);
       pushChat(folderId, "assistant", `❌ ${msg}`);
       showToast("error", msg);
     } finally {
-      if (reqIdRef.current[k] === nextId) updateSession(folderId, { searchingChat: false });
+      if (searchReqIdRef.current[k] === nextId) updateSession(folderId, { searchingChat: false });
     }
   }
 
@@ -771,7 +738,7 @@ export default function App() {
   function switchTab(mode) {
     updateSession(selectedFolderId, { viewMode: mode });
     try {
-      chatInputRef.current?.focus?.();
+      if (mode === "chat") chatInputRef.current?.focus?.();
     } catch {}
   }
 
@@ -867,9 +834,11 @@ export default function App() {
           <div style={styles.sectionLabel}>Folders</div>
           <div style={styles.folderList}>
             {folders.map((f) => {
-              const s = getSession(f.id);
-              const folderIsSearching = s.searchingChat || s.searchingTable;
+              const folderChatSearching = getSession(f.id).searchingChat;
+              const folderTableSearching = getSession(f.id).searchingTable;
               const folderIsUploading = isUploadBusy(f.id);
+
+              const anyBusy = folderChatSearching || folderTableSearching || folderIsUploading;
 
               return (
                 <div
@@ -882,8 +851,8 @@ export default function App() {
                     <span style={styles.folderIcon}>📁</span>
                     <span style={styles.folderNameRow}>{f.name}</span>
                     <span style={styles.folderCount}>{(f.files || []).length}</span>
-                    {(folderIsSearching || folderIsUploading) && (
-                      <span title={folderIsSearching ? "Searching…" : "Uploading…"} style={{ fontSize: 12 }}>
+                    {anyBusy && (
+                      <span title="Busy…" style={{ fontSize: 12 }}>
                         ⏳
                       </span>
                     )}
@@ -912,13 +881,7 @@ export default function App() {
           <div style={styles.uploadRow}>
             <label style={{ ...styles.uploadBtn, opacity: disableUploadCurrentFolder ? 0.6 : 1 }}>
               + Add Files
-              <input
-                type="file"
-                multiple
-                onChange={uploadFiles}
-                style={{ display: "none" }}
-                disabled={disableUploadCurrentFolder}
-              />
+              <input type="file" multiple onChange={uploadFiles} style={{ display: "none" }} disabled={disableUploadCurrentFolder} />
             </label>
 
             {isUploadBusy(selectedFolderId) && (
@@ -984,7 +947,7 @@ export default function App() {
             <div style={styles.chatShell}>
               <div style={styles.chatScroll}>
                 {!chat.length && !session.searchingChat && (
-                  <div style={styles.emptyHint}>Ask a question below. Switch to Table tab to view grid results.</div>
+                  <div style={styles.emptyHint}>Ask a question below.</div>
                 )}
 
                 {chat.map((m) => (
@@ -1023,6 +986,7 @@ export default function App() {
                 <div ref={chatEndRef} />
               </div>
 
+              {/* Chat bottom input */}
               <div style={styles.chatInputBar}>
                 <div style={styles.chatInputInner}>
                   <textarea
@@ -1059,7 +1023,7 @@ export default function App() {
                   <textarea
                     value={session.tableQuery}
                     onChange={(e) => updateSession(selectedFolderId, { tableQuery: e.target.value })}
-                    placeholder="Message LRC.TextSeeker…"
+                    placeholder="Search in selected folder…"
                     style={styles.searchTextarea}
                     maxLength={RULES.queryMax}
                   />
@@ -1071,7 +1035,7 @@ export default function App() {
                         ...(session.searchingTable ? styles.btn : styles.primaryBtn),
                         ...(session.searchingTable ? { borderColor: "#d9d9e3" } : {}),
                       }}
-                      title={session.searchingTable ? "Cancel the running search" : "Run search"}
+                      title={session.searchingTable ? "Cancel the running table search" : "Run search"}
                     >
                       {session.searchingTable ? "Cancel" : "Search"}
                     </button>
@@ -1190,7 +1154,7 @@ export default function App() {
   );
 }
 
-/* ===================== STYLES (unchanged from your file) ===================== */
+/* ===================== STYLES ===================== */
 const styles = {
   page: { width: "100%", minHeight: "100vh", background: "#f7f7f8", overflowX: "hidden" },
 
